@@ -107,11 +107,11 @@ def get_hours(context: ContextTypes.DEFAULT_TYPE, default=24):
         return default
 
 
-async def run_football(update: Update, context: ContextTypes.DEFAULT_TYPE, keys):
+async def run_football(update: Update, context: ContextTypes.DEFAULT_TYPE, keys, hours=None):
     if not ODDS_API_KEY:
         await update.message.reply_text("❌ ODDS_API_KEY is not set on the server.")
         return
-    hours = get_hours(context)
+    hours = hours or get_hours(context)
     await update.message.reply_text("⏳ Crunching the numbers...")
     blocks = []
     try:
@@ -146,6 +146,12 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_football(update, context, list(LEAGUES))
 
 
+def window_cmd(hours):
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await run_football(update, context, list(LEAGUES), hours)
+    return handler
+
+
 async def run_us(update: Update, context: ContextTypes.DEFAULT_TYPE, sport_key, name, emoji):
     if not ODDS_API_KEY:
         await update.message.reply_text("❌ ODDS_API_KEY is not set on the server.")
@@ -162,4 +168,42 @@ async def run_us(update: Update, context: ContextTypes.DEFAULT_TYPE, sport_key, 
         await update.message.reply_text(f"No {name} games with lines in the next {hours}h.")
         return
     header = f"{emoji} <b>{name} - bookmaker consensus</b>\n\n"
-    await send_blocks(update, header, [fmt_us(
+    await send_blocks(update, header, [fmt_us(g, emoji) for g in games])
+
+
+async def nba(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_us(update, context, "basketball_nba", "NBA", "🏀")
+
+
+async def nfl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_us(update, context, "americanfootball_nfl", "NFL", "🏈")
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 <b>EdgePicks Bot</b>\n\n"
+        "⚽ /today - all top-5 leagues (next 24h)\n"
+        "/today48 - next 48h   /today72 - next 72h\n"
+        "/epl /laliga /bundesliga /seriea /ligue1 - one league\n"
+        "🏀 /nba   🏈 /nfl\n\n"
+        "Add hours to widen the window, e.g. <code>/today 48</code> (max 72).",
+        parse_mode="HTML",
+    )
+
+
+def run_bot():
+    if not TOKEN:
+        print("❌ Error: BOT_TOKEN is not set")
+        return
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("today48", window_cmd(48)))
+    app.add_handler(CommandHandler("today72", window_cmd(72)))
+    for key in LEAGUES:
+        app.add_handler(CommandHandler(key, league_cmd(key)))
+    app.add_handler(CommandHandler("nba", nba))
+    app.add_handler(CommandHandler("nfl", nfl))
+    print("🤖 EdgePicks Bot running with polling...")
+    app.run_polling()
