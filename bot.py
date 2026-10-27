@@ -5,7 +5,7 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from engine import COMPETITIONS, CUPS, TOP5, EdgePicksEngine
+from engine import COMPETITIONS, CUPS, TOP5, EdgePicksEngine, _pmf
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
@@ -23,27 +23,60 @@ def esc(s):
     return html.escape(str(s))
 
 
+LEAN = 0.55  # below this a pick is a coin flip, so we say "no clear lean"
+
+
 def pick_result(m, p):
+    """Returns (text, set of outcomes the pick covers)."""
     home, away = esc(m["home"]), esc(m["away"])
     h, d, a = p["p_home"], p["p_draw"], p["p_away"]
     best = max(h, d, a)
     if best >= 0.5:
         if best == h:
-            label = f"{home} to win"
-        elif best == a:
-            label = f"{away} to win"
-        else:
-            label = "Draw"
-        return f"Result: {label} ({pct(best)})"
+            return f"Result: {home} to win ({pct(best)})", {"H"}
+        if best == a:
+            return f"Result: {away} to win ({pct(best)})", {"A"}
+        return f"Result: Draw ({pct(best)})", {"D"}
     options = {
-        f"{home} or Draw": h + d,
-        f"{away} or Draw": a + d,
-        f"{home} or {away}": h + a,
+        (f"Double chance: {home} or Draw", frozenset({"H", "D"})): h + d,
+        (f"Double chance: {away} or Draw", frozenset({"A", "D"})): a + d,
+        (f"No draw: {home} or {away}", frozenset({"H", "A"})): h + a,
     }
-    label, prob = max(options.items(), key=lambda kv: kv[1])
-    if " or Draw" not in label:
-        return f"No draw: {label} ({pct(prob)})"
-    return f"Double chance: {label} ({pct(prob)})"
+    (label, covers), prob = max(options.items(), key=lambda kv: kv[1])
+    return f"{label} ({pct(prob)})", set(covers)
+
+
+def lean(prob_yes, yes_label, no_label):
+    """(label, probability) if there is a clear lean, otherwise None."""
+    if prob_yes >= LEAN:
+        return yes_label, prob_yes
+    if prob_yes <= 1 - LEAN:
+        return no_label, 1 - prob_yes
+    return None
+
+
+def fitting_score(p, allowed, goals, btts):
+    """Most likely scoreline that agrees with the result, goals and BTTS picks."""
+    ph, pa = _pmf(p["xg"][0], 8), _pmf(p["xg"][1], 8)
+    mass = sum(ph) * sum(pa)
+    grid = [(i, j, x * y / mass) for i, x in enumerate(ph) for j, y in enumerate(pa)]
+
+    def ok(i, j, use_goals, use_btts):
+        out = "H" if i > j else ("A" if j > i else "D")
+        if out not in allowed:
+            return False
+        if use_goals and goals is not None and ((i + j > 2.5) != (goals[0] == "Over 2.5")):
+            return False
+        if use_btts and btts is not None and ((i > 0 and j > 0) != (btts[0] == "Yes")):
+            return False
+        return True
+
+    for use_goals, use_btts in ((True, True), (True, False), (False, False)):
+        fits = [g for g in grid if ok(g[0], g[1], use_goals, use_btts)]
+        if fits:
+            i, j, pr = max(fits, key=lambda g: g[2])
+            return f"{i}-{j}", pr
+    return None
 
 
 def news_block(m, p, news, flags):
@@ -75,11 +108,8 @@ def fmt_match(item):
         return head + f"⚠️ {esc(p['error'])}\n\n{SEP}\n\n"
 
     o25 = p["over"][2.5]
-    goals, goals_p = ("Over 2.5", o25) if o25 >= 0.5 else ("Under 2.5", 1 - o25)
-    btts, btts_p = ("Yes", p["btts"]) if p["btts"] >= 0.5 else ("No", 1 - p["btts"])
-    best, best_p = p["top_scores"][0]
-    others = ", ".join(f"{s} ({pct(sp)})" for s, sp in p["top_scores"][1:])
     c, k = p.get("corners"), p.get("cards")
+    top = ", ".join(f"{s} ({pct(sp)})" for s, sp in p["top_scores"])
 
     analysis = (
         "📊 <b>Analysis</b>\n"
@@ -87,28 +117,33 @@ def fmt_match(item):
         f"• Exp. goals: {p['xg'][0]:.1f} - {p['xg'][1]:.1f}\n"
         f"• Over 1.5: {pct(p['over'][1.5])} | 2.5: {pct(o25)} | 3.5: {pct(p['over'][3.5])}\n"
         f"• BTTS: {pct(p['btts'])}\n"
-        f"• Other scores: {others}\n"
+        f"• Likeliest scores: {top}\n"
     )
     if c and k:
         analysis += f"• Corners ~{c['mu']:.1f} | Cards ~{k['mu']:.1f}\n"
 
-    outcomes = (
-        "\n🔥 <b>Most likely outcomes</b>\n"
-        f"• FT score: <b>{best}</b> ({pct(best_p)})\n"
-        f"• {pick_result(m, p)}\n"
-        f"• Goals: <b>{goals}</b> ({pct(goals_p)})\n"
-        f"• BTTS: <b>{btts}</b> ({pct(btts_p)})\n"
-    )
+    result_text, allowed = pick_result(m, p)
+    goals = lean(o25, "Over 2.5", "Under 2.5")
+    btts = lean(p["btts"], "Yes", "No")
+    fit = fitting_score(p, allowed, goals, btts)
+
+    outcomes = "\n🔥 <b>Most likely outcomes</b>\n" + f"• {result_text}\n"
+    outcomes += (f"• Goals: <b>{goals[0]}</b> ({pct(goals[1])})\n" if goals
+                 else f"• Goals: no clear lean (Over 2.5 {pct(o25)})\n")
+    outcomes += (f"• BTTS: <b>{btts[0]}</b> ({pct(btts[1])})\n" if btts
+                 else f"• BTTS: no clear lean ({pct(p['btts'])})\n")
     if c and k:
-        outcomes += (
-            f"• Corners: <b>{c['side']} {c['line']}</b> ({pct(c['prob'])})\n"
-            f"• Cards: <b>{k['side']} {k['line']}</b> ({pct(k['prob'])})\n"
-        )
+        for name, t in (("Corners", c), ("Cards", k)):
+            if t["prob"] >= LEAN:
+                outcomes += f"• {name}: <b>{t['side']} {t['line']}</b> ({pct(t['prob'])})\n"
+            else:
+                outcomes += f"• {name}: no clear lean (~{t['mu']:.1f} expected)\n"
+    if fit:
+        outcomes += f"• Score that fits these picks: <b>{fit[0]}</b> ({pct(fit[1])})\n"
 
     notes, many = news_block(m, p, news, flags)
     conf = p["confidence"] + (" | several injuries listed, treat with caution" if many else "")
-    return head + analysis + outcomes + "\n" + notes + f"🔎 {esc(conf)}\n\n{SEP}\n\n"
-
+    return head + analysis + outcomes + "\n" + notes + f"🔎 Data confidence: {esc(conf)}\n\n{SEP}\n\n"
 
 async def send_blocks(update: Update, header: str, blocks):
     text = header
@@ -180,6 +215,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today48 - next 48h   /today72 - next 72h\n"
         "/epl /laliga /bundesliga /seriea /ligue1\n"
         "/ucl /uel /uecl\n"
+        "/carabao /facup /dfbpokal /copadelrey /coppaitalia /coupe\n"
         "/mls /saudi /internationals\n\n"
         "Add hours to any command, e.g. <code>/laliga 48</code> (max 72).",
         parse_mode="HTML",
