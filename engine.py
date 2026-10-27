@@ -372,3 +372,312 @@ def _apif_season(comp, when):
     if comp.get("calendar_season"):
         return when.year
     return when.year if when.month >= 7 else when.year - 1
+
+class _FixturesMixin:
+    # --------------------------------------------------------------- fixtures
+    @classmethod
+    def get_events(cls, odds_key, comp_id, hours=24):
+        now = datetime.now(timezone.utc)
+        end = now + timedelta(hours=hours)
+        events, errors, ok = [], [], False
+        for k in _keys_for(comp_id, odds_key):
+            try:
+                events += _events_for_key(odds_key, k)
+                ok = True
+            except Exception as e:
+                msg = str(e)
+                if "UNKNOWN_SPORT" in msg or " 404" in msg:
+                    ok = True  # competition not in season
+                else:
+                    errors.append(msg)
+        if not ok and errors:
+            raise RuntimeError(errors[0])
+        out = [{**e, "comp": comp_id, "time": e["when"].strftime("%a %H:%M UTC")}
+               for e in events if now < e["when"] <= end]
+        out.sort(key=lambda e: e["when"])
+        return out
+
+    @classmethod
+    def get_schedule(cls, odds_key):
+        """Every known upcoming match across all competitions (used for rotation flags)."""
+        def build():
+            out = []
+            for cid in COMPETITIONS:
+                for k in _keys_for(cid, odds_key):
+                    try:
+                        out += [{**e, "comp": cid} for e in _events_for_key(odds_key, k)]
+                    except Exception:
+                        continue
+            return out
+        return _cached("schedule", 1800, build)
+
+    @staticmethod
+    def congestion_flags(schedule, match):
+        flags = []
+        for side in ("home", "away"):
+            team = match[side]
+            nxt = [e for e in schedule if e["id"] != match["id"]
+                   and team in (e["home"], e["away"])
+                   and timedelta(0) < e["when"] - match["when"] <= timedelta(hours=96)]
+            if nxt:
+                e = min(nxt, key=lambda x: x["when"])
+                days = max(1, round((e["when"] - match["when"]).total_seconds() / 86400))
+                flags.append(f"{team} play again in {days} day(s) ({COMPETITIONS[e['comp']]['name']}), "
+                             f"rotation possible")
+        return flags
+
+class _StatsMixin:
+    # --------------------------------------------------------- football stats
+    @classmethod
+    def _download(cls, season, div, weight):
+        url = f"{STATS_BASE}/{season}/{div}.csv"
+        try:
+            r = requests.get(url, timeout=25)
+            if r.status_code != 200:
+                print(f"Stats download {url} -> {r.status_code}")
+                return []
+            text = r.content.decode("utf-8-sig", errors="replace")
+        except Exception as e:
+            print(f"Stats download error {url}: {e}")
+            return []
+        rows = []
+        for row in csv.DictReader(io.StringIO(text)):
+            try:
+                rows.append((
+                    weight,
+                    row["HomeTeam"].strip(), row["AwayTeam"].strip(),
+                    (float(row["FTHG"]), float(row["HC"]), float(row["HY"]) + float(row["HR"])),
+                    (float(row["FTAG"]), float(row["AC"]), float(row["AY"]) + float(row["AR"])),
+                    _parse_date(row.get("Date", "")),
+                    (row.get("Referee") or "").strip(),
+                ))
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+        return rows
+
+    @staticmethod
+    def _aggregate(rows):
+        teams, refs, last = {}, {}, {}
+        lg = {"home": [0.0] * 3, "away": [0.0] * 3}
+        lg_n = 0.0
+        for w, h, a, hv, av, date, ref in rows:
+            for team, venue, mine, theirs in ((h, "home", hv, av), (a, "away", av, hv)):
+                rec = teams.setdefault(team, {
+                    "home": {"n": 0.0, "f": [0.0] * 3, "a": [0.0] * 3},
+                    "away": {"n": 0.0, "f": [0.0] * 3, "a": [0.0] * 3},
+                })[venue]
+                rec["n"] += w
+                for i in range(3):
+                    rec["f"][i] += w * mine[i]
+                    rec["a"][i] += w * theirs[i]
+                if date and (team not in last or date > last[team]):
+                    last[team] = date
+            lg_n += w
+            for i in range(3):
+                lg["home"][i] += w * hv[i]
+                lg["away"][i] += w * av[i]
+            rk = _ref_key(ref)
+            if rk:
+                r = refs.setdefault(rk, [0.0, 0.0])
+                r[0] += w
+                r[1] += w * (hv[2] + av[2])
+        return {
+            "teams": teams, "refs": refs, "last_played": last,
+            "lg_home": [max(x / lg_n, 1e-6) for x in lg["home"]],
+            "lg_away": [max(x / lg_n, 1e-6) for x in lg["away"]],
+        }
+
+    @classmethod
+    def _load_league(cls, comp_id):
+        div = COMPETITIONS[comp_id]["fd"]
+
+        def build():
+            cur, prev = _season_codes(datetime.now(timezone.utc))
+            rows = cls._download(cur, div, 1.0) + cls._download(prev, div, 0.5)
+            if not rows:
+                raise RuntimeError("no stats")
+            return cls._aggregate(rows)
+        try:
+            return _cached(f"stats:{comp_id}", 6 * 3600, build)
+        except Exception as e:
+            print(f"[stats] {comp_id}: {e}")
+            return None
+
+    @staticmethod
+    def _expect(stats, home, away, i):
+        lg_h, lg_a = stats["lg_home"][i], stats["lg_away"][i]
+        H = stats["teams"].get(home)
+        A = stats["teams"].get(away)
+
+        def shrunk(rec, key, prior):
+            if not rec or rec["n"] <= 0:
+                return prior, 0.0
+            return (rec[key][i] + prior * SHRINK_K) / (rec["n"] + SHRINK_K), rec["n"]
+
+        hf, n1 = shrunk(H["home"] if H else None, "f", lg_h)
+        aa, n2 = shrunk(A["away"] if A else None, "a", lg_h)
+        af, n3 = shrunk(A["away"] if A else None, "f", lg_a)
+        ha, n4 = shrunk(H["home"] if H else None, "a", lg_a)
+        return hf * aa / lg_h, af * ha / lg_a, min(n1, n2, n3, n4)
+
+    @classmethod
+    def predict_football(cls, comp_id, home_name, away_name, kickoff=None, referee=None):
+        stats = cls._load_league(comp_id)
+        if not stats:
+            return {"success": False, "error": "Team stats unavailable right now (data source down)."}
+        names = list(stats["teams"])
+        home = _match_name(home_name, names)
+        away = _match_name(away_name, names)
+        for given, found in ((home_name, home), (away_name, away)):
+            if found is None:
+                print(f"[team match] no match for '{given}'")
+
+        mu_h, mu_a, n = cls._expect(stats, home, away, 0)
+        c_h, c_a, _ = cls._expect(stats, home, away, 1)
+        k_h, k_a, _ = cls._expect(stats, home, away, 2)
+
+        k_mu, ref_info = k_h + k_a, None
+        rec = stats["refs"].get(_ref_key(referee)) if referee else None
+        if rec:
+            lg_tot = stats["lg_home"][2] + stats["lg_away"][2]
+            avg = (rec[1] + lg_tot * REF_K) / (rec[0] + REF_K)
+            k_mu *= min(1.25, max(0.8, avg / lg_tot))
+            ref_info = {"name": referee, "avg": avg}
+
+        rest = []
+        if kickoff:
+            for team, shown in ((home, home_name), (away, away_name)):
+                last = stats["last_played"].get(team) if team else None
+                if last:
+                    days = (kickoff.date() - last).days
+                    if 1 <= days <= 3:
+                        rest.append(f"{shown} played {days} day(s) before this match")
+
+        if home is None or away is None:
+            conf = "Low (team not found, league averages used)"
+        elif n >= 10:
+            conf = "High"
+        elif n >= 5:
+            conf = "Medium"
+        else:
+            conf = "Low (small sample)"
+
+        out = _summarize(mu_h, mu_a)
+        out.update(success=True, corners=_lean_total(c_h + c_a), cards=_lean_total(k_mu),
+                   referee=ref_info, rest_flags=rest, confidence=conf)
+        return out
+
+class _MarketMixin:
+    # ---------------------------------------------- bookmaker-based competitions
+    @classmethod
+    def get_market_probs(cls, odds_key, sport_key):
+        def fetch():
+            if cls.credits_left is not None and cls.credits_left < CREDIT_FLOOR:
+                raise RuntimeError("credits low")
+            now = datetime.now(timezone.utc)
+            data = _odds_get(f"/sports/{sport_key}/odds", odds_key, regions="eu",
+                             markets="h2h,totals", oddsFormat="decimal", dateFormat="iso",
+                             commenceTimeFrom=_iso(now),
+                             commenceTimeTo=_iso(now + timedelta(hours=72)))
+            out = {}
+            for ev in data:
+                c = _consensus(ev)
+                if c:
+                    out[ev["id"]] = c
+            return out
+        return _cached(f"mkt:{sport_key}", 6 * 3600, fetch)
+
+    @classmethod
+    def predict_market(cls, odds_key, ev):
+        try:
+            table = cls.get_market_probs(odds_key, ev["sport_key"])
+        except Exception as e:
+            print(f"[market] {e}")
+            return {"success": False,
+                    "error": "Bookmaker prices unavailable right now (credits paused or API error)."}
+        c = table.get(ev["id"])
+        if not c:
+            return {"success": False, "error": "No bookmaker prices posted for this match yet."}
+        lh, la = _fit_lambdas(c)
+        out = _summarize(lh, la)
+        out.update(success=True, corners=None, cards=None, referee=None, rest_flags=[],
+                   confidence="Bookmaker consensus (no team-stats model here)")
+        return out
+
+    # ------------------------------------------------------------ team news
+    @classmethod
+    def _apif_day(cls, comp_id, date_str, apif_key, when):
+        comp = COMPETITIONS[comp_id]
+        season = _apif_season(comp, when)
+
+        def fetch():
+            inj = _apif_get("/injuries", apif_key, league=comp["apif"], season=season, date=date_str)
+            if inj is None:
+                raise RuntimeError("skipped")
+            fx = []
+            if comp.get("fd"):  # fixtures are only needed for the referee
+                fx = _apif_get("/fixtures", apif_key, league=comp["apif"], season=season,
+                               date=date_str) or []
+            return {"inj": inj, "fx": fx}
+        return _cached(f"apif:{comp_id}:{date_str}", 6 * 3600, fetch)
+
+    @classmethod
+    def team_news(cls, comp_id, apif_key, match):
+        comp = COMPETITIONS[comp_id]
+        if not apif_key or not comp.get("apif"):
+            return None
+        try:
+            day = cls._apif_day(comp_id, match["when"].strftime("%Y-%m-%d"), apif_key, match["when"])
+        except Exception:
+            return None
+        by_team = {}
+        for it in day["inj"]:
+            try:
+                label = it["player"]["name"]
+                reason = (it["player"].get("reason") or "").strip()
+                if reason:
+                    label += f" ({reason.lower()})"
+                by_team.setdefault(it["team"]["name"], []).append(label)
+            except (KeyError, TypeError):
+                continue
+        news = {"injuries_known": bool(by_team), "home": [], "away": [], "referee": None}
+        if by_team:
+            for side in ("home", "away"):
+                t = _match_name(match[side], list(by_team))
+                news[side] = by_team.get(t, []) if t else []
+        for fx in day["fx"]:
+            try:
+                h = _match_name(match["home"], [fx["teams"]["home"]["name"]])
+                a = _match_name(match["away"], [fx["teams"]["away"]["name"]])
+                if h and a and fx["fixture"].get("referee"):
+                    news["referee"] = fx["fixture"]["referee"].split(",")[0].strip()
+                    break
+            except (KeyError, TypeError):
+                continue
+        return news
+
+    # --------------------------------------------------------------- main entry
+    @classmethod
+    def analyze_competition(cls, odds_key, apif_key, comp_id, hours=24):
+        events = cls.get_events(odds_key, comp_id, hours)
+        if not events:
+            return []
+        try:
+            schedule = cls.get_schedule(odds_key)
+        except Exception:
+            schedule = []
+        out = []
+        for ev in events:
+            news = cls.team_news(comp_id, apif_key, ev)
+            if COMPETITIONS[comp_id].get("fd"):
+                pred = cls.predict_football(comp_id, ev["home"], ev["away"], ev["when"],
+                                            news["referee"] if news else None)
+            else:
+                pred = cls.predict_market(odds_key, ev)
+            out.append({"event": ev, "pred": pred, "news": news,
+                        "flags": cls.congestion_flags(schedule, ev)})
+        return out
+
+
+class EdgePicksEngine(_FixturesMixin, _StatsMixin, _MarketMixin):
+    credits_left = None
