@@ -540,4 +540,137 @@ class EdgePicksEngine:
             lg_tot = stats["lg_home"][2] + stats["lg_away"][2]
             avg = (rec[1] + lg_tot * REF_K) / (rec[0] + REF_K)
             k_mu *= min(1.25, max(0.8, avg / lg_tot))
-            ref_info = {"name": refer
+            ref_info = {"name": referee, "avg": avg}
+
+        rest = []
+        if kickoff:
+            for team, shown in ((home, home_name), (away, away_name)):
+                last = stats["last_played"].get(team) if team else None
+                if last:
+                    days = (kickoff.date() - last).days
+                    if 1 <= days <= 3:
+                        rest.append(f"{shown} played {days} day(s) before this match")
+
+        if home is None or away is None:
+            conf = "Low (team not found, league averages used)"
+        elif n >= 10:
+            conf = "High"
+        elif n >= 5:
+            conf = "Medium"
+        else:
+            conf = "Low (small sample)"
+
+        out = _summarize(mu_h, mu_a)
+        out.update(success=True, corners=_lean_total(c_h + c_a), cards=_lean_total(k_mu),
+                   referee=ref_info, rest_flags=rest, confidence=conf)
+        return out
+
+    # ---------------------------------------------- bookmaker-based competitions
+    @classmethod
+    def get_market_probs(cls, odds_key, sport_key):
+        def fetch():
+            if cls.credits_left is not None and cls.credits_left < CREDIT_FLOOR:
+                raise RuntimeError("credits low")
+            now = datetime.now(timezone.utc)
+            data = _odds_get(f"/sports/{sport_key}/odds", odds_key, regions="eu",
+                             markets="h2h,totals", oddsFormat="decimal", dateFormat="iso",
+                             commenceTimeFrom=_iso(now),
+                             commenceTimeTo=_iso(now + timedelta(hours=72)))
+            out = {}
+            for ev in data:
+                c = _consensus(ev)
+                if c:
+                    out[ev["id"]] = c
+            return out
+        return _cached(f"mkt:{sport_key}", 6 * 3600, fetch)
+
+    @classmethod
+    def predict_market(cls, odds_key, ev):
+        try:
+            table = cls.get_market_probs(odds_key, ev["sport_key"])
+        except Exception as e:
+            print(f"[market] {e}")
+            return {"success": False,
+                    "error": "Bookmaker prices unavailable right now (credits paused or API error)."}
+        c = table.get(ev["id"])
+        if not c:
+            return {"success": False, "error": "No bookmaker prices posted for this match yet."}
+        lh, la = _fit_lambdas(c)
+        out = _summarize(lh, la)
+        out.update(success=True, corners=None, cards=None, referee=None, rest_flags=[],
+                   confidence="Bookmaker consensus (no team-stats model here)")
+        return out
+
+    # ------------------------------------------------------------ team news
+    @classmethod
+    def _apif_day(cls, comp_id, date_str, apif_key, when):
+        comp = COMPETITIONS[comp_id]
+        season = _apif_season(comp, when)
+
+        def fetch():
+            inj = _apif_get("/injuries", apif_key, league=comp["apif"], season=season, date=date_str)
+            if inj is None:
+                raise RuntimeError("skipped")
+            fx = []
+            if comp.get("fd"):  # fixtures are only needed for the referee
+                fx = _apif_get("/fixtures", apif_key, league=comp["apif"], season=season,
+                               date=date_str) or []
+            return {"inj": inj, "fx": fx}
+        return _cached(f"apif:{comp_id}:{date_str}", 6 * 3600, fetch)
+
+    @classmethod
+    def team_news(cls, comp_id, apif_key, match):
+        comp = COMPETITIONS[comp_id]
+        if not apif_key or not comp.get("apif"):
+            return None
+        try:
+            day = cls._apif_day(comp_id, match["when"].strftime("%Y-%m-%d"), apif_key, match["when"])
+        except Exception:
+            return None
+        by_team = {}
+        for it in day["inj"]:
+            try:
+                label = it["player"]["name"]
+                reason = (it["player"].get("reason") or "").strip()
+                if reason:
+                    label += f" ({reason.lower()})"
+                by_team.setdefault(it["team"]["name"], []).append(label)
+            except (KeyError, TypeError):
+                continue
+        news = {"injuries_known": bool(by_team), "home": [], "away": [], "referee": None}
+        if by_team:
+            for side in ("home", "away"):
+                t = _match_name(match[side], list(by_team))
+                news[side] = by_team.get(t, []) if t else []
+        for fx in day["fx"]:
+            try:
+                h = _match_name(match["home"], [fx["teams"]["home"]["name"]])
+                a = _match_name(match["away"], [fx["teams"]["away"]["name"]])
+                if h and a and fx["fixture"].get("referee"):
+                    news["referee"] = fx["fixture"]["referee"].split(",")[0].strip()
+                    break
+            except (KeyError, TypeError):
+                continue
+        return news
+
+    # --------------------------------------------------------------- main entry
+    @classmethod
+    def analyze_competition(cls, odds_key, apif_key, comp_id, hours=24):
+        events = cls.get_events(odds_key, comp_id, hours)
+        if not events:
+            return []
+        try:
+            schedule = cls.get_schedule(odds_key)
+        except Exception:
+            schedule = []
+        out = []
+        for ev in events:
+            news = cls.team_news(comp_id, apif_key, ev)
+            if COMPETITIONS[comp_id].get("fd"):
+                pred = cls.predict_football(comp_id, ev["home"], ev["away"], ev["when"],
+                                            news["referee"] if news else None)
+            else:
+                pred = cls.predict_market(odds_key, ev)
+            out.append({"event": ev, "pred": pred, "news": news,
+                        "flags": cls.congestion_flags(schedule, ev)})
+        return out
